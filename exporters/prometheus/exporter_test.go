@@ -17,6 +17,7 @@ package prometheus
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -54,6 +55,36 @@ func TestPrometheusExporter(t *testing.T) {
 				counter, err := meter.Float64Counter(
 					"foo",
 					otelmetric.WithDescription("a simple counter"),
+					otelmetric.WithUnit("ms"),
+				)
+				require.NoError(t, err)
+				counter.Add(ctx, 5, opt)
+				counter.Add(ctx, 10.3, opt)
+				counter.Add(ctx, 9, opt)
+
+				attrs2 := attribute.NewSet(
+					attribute.Key("A").String("D"),
+					attribute.Key("C").String("B"),
+					attribute.Key("E").Bool(true),
+					attribute.Key("F").Int(42),
+				)
+				counter.Add(ctx, 5, otelmetric.WithAttributeSet(attrs2))
+			},
+		},
+		{
+			name:         "counter with suffixes disabled",
+			expectedFile: "testdata/counter_disabled_suffix.txt",
+			options:      []Option{WithoutCounterSuffixes()},
+			recordMetrics: func(ctx context.Context, meter otelmetric.Meter) {
+				opt := otelmetric.WithAttributes(
+					attribute.Key("A").String("B"),
+					attribute.Key("C").String("D"),
+					attribute.Key("E").Bool(true),
+					attribute.Key("F").Int(42),
+				)
+				counter, err := meter.Float64Counter(
+					"foo",
+					otelmetric.WithDescription("a simple counter without a total suffix"),
 					otelmetric.WithUnit("ms"),
 				)
 				require.NoError(t, err)
@@ -671,4 +702,60 @@ func TestDuplicateMetrics(t *testing.T) {
 			require.Truef(t, match, "expected export not produced: %v", err)
 		})
 	}
+}
+
+func TestCollectorConcurrentSafe(t *testing.T) {
+	// This tests makes sure that the implemented
+	// https://pkg.go.dev/github.com/prometheus/client_golang/prometheus#Collector
+	// is concurrent safe.
+	ctx := context.Background()
+	registry := prometheus.NewRegistry()
+	exporter, err := New(WithRegisterer(registry))
+	require.NoError(t, err)
+	provider := metric.NewMeterProvider(metric.WithReader(exporter))
+	meter := provider.Meter("testmeter")
+	cnt, err := meter.Int64Counter("foo")
+	require.NoError(t, err)
+	cnt.Add(ctx, 100)
+
+	var wg sync.WaitGroup
+	concurrencyLevel := 10
+	for i := 0; i < concurrencyLevel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := registry.Gather() // this calls collector.Collect
+			assert.NoError(t, err)
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestIncompatibleMeterName(t *testing.T) {
+	// This test checks that Prometheus exporter ignores
+	// when it encounters incompatible meter name.
+
+	// Invalid label or metric name leads to error returned from
+	// createScopeInfoMetric.
+	invalidName := string([]byte{0xff, 0xfe, 0xfd})
+
+	ctx := context.Background()
+	registry := prometheus.NewRegistry()
+	exporter, err := New(WithRegisterer(registry))
+	require.NoError(t, err)
+	provider := metric.NewMeterProvider(
+		metric.WithResource(resource.Empty()),
+		metric.WithReader(exporter))
+	meter := provider.Meter(invalidName)
+	cnt, err := meter.Int64Counter("foo")
+	require.NoError(t, err)
+	cnt.Add(ctx, 100)
+
+	file, err := os.Open("testdata/TestIncompatibleMeterName.txt")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+
+	err = testutil.GatherAndCompare(registry, file)
+	require.NoError(t, err)
 }

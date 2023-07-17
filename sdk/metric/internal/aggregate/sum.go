@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package internal // import "go.opentelemetry.io/otel/sdk/metric/internal"
+package aggregate // import "go.opentelemetry.io/otel/sdk/metric/internal/aggregate"
 
 import (
 	"sync"
@@ -255,10 +255,12 @@ type precomputedDeltaSum[N int64 | float64] struct {
 // collection cycle, and the unfiltered-sum is kept for the next collection
 // cycle.
 func (s *precomputedDeltaSum[N]) Aggregation() metricdata.Aggregation {
+	newReported := make(map[attribute.Set]N)
 	s.Lock()
 	defer s.Unlock()
 
 	if len(s.values) == 0 {
+		s.reported = newReported
 		return nil
 	}
 
@@ -277,16 +279,12 @@ func (s *precomputedDeltaSum[N]) Aggregation() metricdata.Aggregation {
 			Time:       t,
 			Value:      delta,
 		})
-		if delta != 0 {
-			s.reported[attr] = v
-		}
-		value.filtered = N(0)
-		s.values[attr] = value
-		// TODO (#3006): This will use an unbounded amount of memory if there
-		// are unbounded number of attribute sets being aggregated. Attribute
-		// sets that become "stale" need to be forgotten so this will not
-		// overload the system.
+		newReported[attr] = v
+		// Unused attribute sets do not report.
+		delete(s.values, attr)
 	}
+	// Unused attribute sets are forgotten.
+	s.reported = newReported
 	// The delta collection cycle resets.
 	s.start = t
 	return out
@@ -349,12 +347,8 @@ func (s *precomputedCumulativeSum[N]) Aggregation() metricdata.Aggregation {
 			Time:       t,
 			Value:      value.measured + value.filtered,
 		})
-		value.filtered = N(0)
-		s.values[attr] = value
-		// TODO (#3006): This will use an unbounded amount of memory if there
-		// are unbounded number of attribute sets being aggregated. Attribute
-		// sets that become "stale" need to be forgotten so this will not
-		// overload the system.
+		// Unused attribute sets do not report.
+		delete(s.values, attr)
 	}
 	return out
 }
